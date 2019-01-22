@@ -142,42 +142,42 @@ void wifi_sniffer_packet_handler(void *buff, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_MGMT)
     return;
 
-  char buf[255];
+  char buf[40];
   const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
   const uint8_t *packetData = ppkt->payload;
   unsigned int frameControl = ((unsigned int)packetData[1] << 8) + packetData[0];
   uint8_t frameSubType = (frameControl & 0b0000000011110000) >> 4;
 
   const uint8_t *ssid_start, *src, *dst;
-  const char * packetType = "  ??  ";
+  char packetType = '?';
   switch (frameSubType)
   {
   case (SUBTYPE_PROBE_REQUEST):
     ssid_start = packetData + 24;
     src = packetData + 10;
     dst = packetData + 16;
-    packetType = "probe ";
+    packetType = 'P';
     break;
 
   case (SUBTYPE_PROBE_RESPONSE):
     ssid_start = packetData + 36;
     src = packetData + 16;
     dst = packetData + 10;
-    packetType = "resp  ";
+    packetType = 'R';
     break;
 
   case (SUBTYPE_BEACON):
     ssid_start = packetData + 36;
     src = packetData + 16;
     dst = packetData + 10;
-    packetType = "beacon";
+    packetType = 'B';
     break;
 
   default:
     ssid_start = packetData + 36;
     dst = packetData + 10;
     src = packetData + 16;
-    packetType = "  ??  ";
+    packetType = '?';
   }
   uint8_t ssid_type = ssid_start[0];
   uint8_t ssid_len = ssid_start[1];
@@ -194,16 +194,20 @@ void wifi_sniffer_packet_handler(void *buff, wifi_promiscuous_pkt_type_t type) {
   memcpy(macbuf + maccounter * 6, src, 6);
   maccounter = (maccounter >= mac_lru) ? 0 : maccounter + 1;
 
-  sprintf(buf, "%s,%02d,%02d,"
-               "%02x:%02x:%02x:%02x:%02x:%02x,",
-          packetType,
-          ppkt->rx_ctrl.channel,
-          ppkt->rx_ctrl.rssi,
-          /* src */
-          src[0], src[1], src[2], src[3], src[4], src[5]);
-  Serial.print(buf);
-  Serial.write(ssid, ssid_len);
-  Serial.println();
+  for (int i = 0; i < sizeof(buf); i++) buf[i] = 0;
+
+  size_t buflen = sprintf(buf, "%c,%02d,%02d,"
+                               "%02x%02x%02x%02x%02x%02x,",
+                          packetType,
+                          ppkt->rx_ctrl.channel,
+                          ppkt->rx_ctrl.rssi,
+                          /* src */
+                          src[0], src[1], src[2], src[3], src[4], src[5]);
+  memccpy(buf + buflen, ssid, ssid_len, 40 - buflen);
+  buflen += ssid_len;
+  buf[buflen++] = '\r';
+  buf[buflen++] = '\n';
+  Serial.write((uint8_t*) buf, buflen);
 }
 
 // the setup function runs once when you press reset or power the board
