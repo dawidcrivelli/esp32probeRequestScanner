@@ -11,15 +11,27 @@
 #define LED_GPIO_PIN                     0
 #define WIFI_CHANNEL_SWITCH_INTERVAL  (200)
 #define WIFI_CHANNEL_MAX               (13)
+#define SKIP_EMPTY false
 
-uint8_t level = 0, channel = 1;
+#define DATA_LENGTH 112
 
-// static wifi_country_t wifi_country = WIFI_COUNTRY_EU;
+#define TYPE_MANAGEMENT 0x00
+#define TYPE_CONTROL 0x01
+#define TYPE_DATA 0x02
+#define SUBTYPE_PROBE_REQUEST 0x04
+#define SUBTYPE_PROBE_RESPONSE 0x05
+#define SUBTYPE_BEACON 0x08
+
+uint8_t channel = 1;
+
+constexpr int mac_lru = 10;
+static uint8_t macbuf[6 * mac_lru];
+static int maccounter = 0;
 
 typedef struct {
   unsigned frame_ctrl:16;
   unsigned duration_id:16;
-  uint8_t addr1[6]; /* receiver address */
+  uint8_t src[6]; /* receiver address */
   uint8_t addr2[6]; /* sender address */
   uint8_t addr3[6]; /* filtering address */
   unsigned sequence_ctrl:16;
@@ -31,12 +43,6 @@ typedef struct {
   uint8_t payload[0]; /* network data ended with 4 bytes csum (CRC32) */
 } wifi_ieee80211_packet_t;
 
-#define DATA_LENGTH 112
-
-#define TYPE_MANAGEMENT 0x00
-#define TYPE_CONTROL 0x01
-#define TYPE_DATA 0x02
-#define SUBTYPE_PROBE_REQUEST 0x04
 
 static esp_err_t event_handler(void *ctx, system_event_t *event);
 static void wifi_sniffer_init(void);
@@ -100,16 +106,6 @@ void wifi_sniffer_set_channel(uint8_t channel)
   esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 }
 
-const char * wifi_sniffer_packet_type2str(wifi_promiscuous_pkt_type_t type)
-{
-  switch(type) {
-  case WIFI_PKT_MGMT: return "MGMT";
-  case WIFI_PKT_DATA: return "DATA";
-  default:
-  case WIFI_PKT_MISC: return "MISC";
-  }
-}
-
 // void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type)
 // {
 //   if (type != WIFI_PKT_MGMT)
@@ -121,17 +117,17 @@ const char * wifi_sniffer_packet_type2str(wifi_promiscuous_pkt_type_t type)
 //   const wifi_ieee80211_mac_hdr_t *hdr = &ipkt->hdr;
 
 //   sprintf(buf, "PACKET TYPE=%s, CHAN=%02d, RSSI=%02d, len = %3d, "
-//                " ADDR1=%02x:%02x:%02x:%02x:%02x:%02x,"
+//                " src=%02x:%02x:%02x:%02x:%02x:%02x,"
 //                " ADDR2=%02x:%02x:%02x:%02x:%02x:%02x,"
 //                " ADDR3=%02x:%02x:%02x:%02x:%02x:%02x\r\n",
 //           wifi_sniffer_packet_type2str(type),
 //           ppkt->rx_ctrl.channel,
 //           ppkt->rx_ctrl.rssi,
 //           ppkt->rx_ctrl.sig_len,
-//               /* ADDR1 */
-//               hdr->addr1[0],
-//           hdr->addr1[1], hdr->addr1[2],
-//           hdr->addr1[3], hdr->addr1[4], hdr->addr1[5],
+//               /* src */
+//               hdr->src[0],
+//           hdr->src[1], hdr->src[2],
+//           hdr->src[3], hdr->src[4], hdr->src[5],
 //           /* ADDR2 */
 //           hdr->addr2[0], hdr->addr2[1], hdr->addr2[2],
 //           hdr->addr2[3], hdr->addr2[4], hdr->addr2[5],
@@ -142,53 +138,69 @@ const char * wifi_sniffer_packet_type2str(wifi_promiscuous_pkt_type_t type)
 // }
 
 
-void wifi_sniffer_packet_handler(void *buff, wifi_promiscuous_pkt_type_t type)
-{
+void wifi_sniffer_packet_handler(void *buff, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_MGMT)
     return;
-
-  constexpr int mac_lru = 10;
-  static uint8_t macbuf[6 * mac_lru];
-  int maccounter = 0;
 
   char buf[255];
   const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
   const uint8_t *packetData = ppkt->payload;
-  const uint8_t *addr1 = packetData + 10;
-  const uint8_t *ssid = packetData + 26;
-  uint8_t ssid_type = packetData[24];
-  uint8_t ssid_len = packetData[25];
-
   unsigned int frameControl = ((unsigned int)packetData[1] << 8) + packetData[0];
-
-  uint8_t version = (frameControl & 0b0000000000000011) >> 0;
   uint8_t frameSubType = (frameControl & 0b0000000011110000) >> 4;
-  uint8_t toDS = (frameControl & 0b0000000100000000) >> 8;
-  uint8_t fromDS = (frameControl & 0b0000001000000000) >> 9;
 
-  if (frameSubType != SUBTYPE_PROBE_REQUEST)
-    return;
+  const uint8_t *ssid_start, *src, *dst;
+  const char * packetType = "  ??  ";
+  switch (frameSubType)
+  {
+  case (SUBTYPE_PROBE_REQUEST):
+    ssid_start = packetData + 24;
+    src = packetData + 10;
+    dst = packetData + 16;
+    packetType = "probe ";
+    break;
 
+  case (SUBTYPE_PROBE_RESPONSE):
+    ssid_start = packetData + 36;
+    src = packetData + 16;
+    dst = packetData + 10;
+    packetType = "resp  ";
+    break;
 
-  //skip broadcast or empty probe requests
-  // if (ssid_type != 0 || ssid_len == 0)
-    // return;
+  case (SUBTYPE_BEACON):
+    ssid_start = packetData + 36;
+    src = packetData + 16;
+    dst = packetData + 10;
+    packetType = "beacon";
+    break;
+
+  default:
+    ssid_start = packetData + 36;
+    dst = packetData + 10;
+    src = packetData + 16;
+    packetType = "  ??  ";
+  }
+  uint8_t ssid_type = ssid_start[0];
+  uint8_t ssid_len = ssid_start[1];
+  const uint8_t *ssid = ssid_start + 2;
+
+  //still print malformatted
+  if (ssid_type != 0)
+    ssid_len = 0;
 
   for (int i = 0; i < mac_lru; i++)
-    if (memcmp(macbuf + i * 6, addr1, 6) == 0)
+    if (memcmp(macbuf + i * 6, src, 6) == 0)
       return;
 
-  memcpy(macbuf + maccounter * 6, addr1, 6);
+  memcpy(macbuf + maccounter * 6, src, 6);
   maccounter = (maccounter >= mac_lru) ? 0 : maccounter + 1;
 
-  sprintf(buf, "CHAN=%02d, RSSI=%02d, len = %3d, SSID len= %3d "
-               " ADDR=%02x:%02x:%02x:%02x:%02x:%02x, ",
+  sprintf(buf, "%s,%02d,%02d,"
+               "%02x:%02x:%02x:%02x:%02x:%02x,",
+          packetType,
           ppkt->rx_ctrl.channel,
           ppkt->rx_ctrl.rssi,
-          ppkt->rx_ctrl.sig_len,
-          ssid_len,
-          /* ADDR1 */
-          addr1[0], addr1[1], addr1[2], addr1[3], addr1[4], addr1[5]);
+          /* src */
+          src[0], src[1], src[2], src[3], src[4], src[5]);
   Serial.print(buf);
   Serial.write(ssid, ssid_len);
   Serial.println();
@@ -216,5 +228,5 @@ void loop() {
     digitalWrite(LED_GPIO_PIN, LOW);
   vTaskDelay(WIFI_CHANNEL_SWITCH_INTERVAL / portTICK_PERIOD_MS);
   wifi_sniffer_set_channel(channel);
-  channel = (channel > 14) ? 1 : channel + 1;
+  channel = (channel > WIFI_CHANNEL_MAX) ? 1 : channel + 1;
 }
